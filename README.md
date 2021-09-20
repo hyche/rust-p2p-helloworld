@@ -2,9 +2,9 @@
 A simple p2p network written in Rust. Read here for more details https://github.com/massbitprotocol/helloworld-rust-project
 
 # Usage
-Compile and run with 
+Compile and run with
 ```sh
-RUST_LOG=info cargo run
+RUST_LOG=info SERVER_ADDRESS=127.0.0.1:3000 cargo run
 ```
 
 Send JSON-RPC command with curl
