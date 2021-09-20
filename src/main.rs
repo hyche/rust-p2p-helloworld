@@ -256,11 +256,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 },
                 message = rx.recv() => {
-                    swarm
-                        .behaviour_mut()
-                        .gossip
-                        .publish(META_TOPIC.clone(), message.unwrap()).unwrap();
-
+                    let node_num = swarm.behaviour().mdns.discovered_nodes().len();
+                    if  node_num > 1 {
+                        // Publish only when there are more than 2 peers in the network
+                        log::info!("Publish to other {} nodes", node_num);
+                        if let Err(err) = swarm
+                            .behaviour_mut()
+                            .gossip
+                            .publish(META_TOPIC.clone(), message.unwrap()) {
+                                log::error!("{:?}", err)
+                        }
+                    }
                 }
             }
         }
