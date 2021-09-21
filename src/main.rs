@@ -31,7 +31,7 @@ lazy_static! {
     static ref META_TOPIC: IdentTopic = IdentTopic::new("meta");
 }
 
-#[derive(Default, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 struct Pokemon {
     name: String,
     color: String,
@@ -44,12 +44,46 @@ struct Pokemon {
     mouth_num: u32,
 }
 
-#[derive(Deserialize)]
+fn retrieve_pokemon(db: Db, name: &str) -> Result<Pokemon, Error> {
+    db.lock()
+        .unwrap()
+        .get(name)
+        .map(|value| value.to_owned())
+        .ok_or_else(|| Error::invalid_params("Entry not found!"))
+}
+
+fn create_pokemon(db: Db, pokemon: Pokemon) -> Result<Pokemon, Error> {
+    let db = &mut *db.lock().unwrap();
+    if db.contains_key(&pokemon.name) {
+        return Err(Error::invalid_params("Entry already exists!".to_string()));
+    }
+    let _ = db.insert(pokemon.name.clone(), pokemon.clone());
+    Ok(pokemon)
+}
+
+fn update_pokemon(db: Db, pokemon: Pokemon) -> Result<Pokemon, Error> {
+    db.lock()
+        .unwrap()
+        .get_mut(&pokemon.name)
+        .map(|value| {
+            *value = pokemon.clone();
+            pokemon
+        })
+        .ok_or_else(|| Error::invalid_params("Entry not found!"))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct SearchParams {
     name: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
+enum Message {
+    Updated(Pokemon),
+    Created(Pokemon),
+    Retrieved(SearchParams),
+}
+
 enum PeerEvent {
     Gossipsub(GossipsubEvent),
     Mdns(MdnsEvent),
@@ -133,7 +167,7 @@ async fn construct_network_swarm() -> Swarm<PeerBehaviour> {
 
 fn construct_jsonrpc_server(
     mem_db: Db,
-    sender: mpsc::Sender<String>,
+    sender: mpsc::Sender<Message>,
     server_address: SocketAddr,
     server_threads: usize,
 ) -> Result<Server, std::io::Error> {
@@ -149,14 +183,10 @@ fn construct_jsonrpc_server(
         async move {
             let params: SearchParams = params.parse()?;
             sender
-                .send(format!("Retrieve Pokemon named `{}`", &params.name))
+                .send(Message::Retrieved(params.clone()))
                 .await
                 .unwrap();
-            db.lock()
-                .unwrap()
-                .get(&params.name)
-                .map(|value| serde_json::to_value(value).unwrap())
-                .ok_or_else(|| Error::invalid_params("Entry not found!"))
+            Ok(serde_json::to_value(retrieve_pokemon(db, &params.name)?).unwrap())
         }
     });
     io.add_method("create_pokemon", move |params: Params| {
@@ -165,15 +195,10 @@ fn construct_jsonrpc_server(
         async move {
             let pokemon: Pokemon = params.parse()?;
             sender
-                .send(format!("Create Pokemon named `{}`", &pokemon.name))
+                .send(Message::Created(pokemon.clone()))
                 .await
                 .unwrap();
-            let db = &mut *db.lock().unwrap();
-            if db.contains_key(&pokemon.name) {
-                return Err(Error::invalid_params("Entry already exists!".to_string()));
-            }
-            let _ = db.insert(pokemon.name.clone(), pokemon.clone());
-            Ok(serde_json::to_value(pokemon).unwrap())
+            Ok(serde_json::to_value(create_pokemon(db, pokemon)?).unwrap())
         }
     });
     io.add_method("update_pokemon", move |params: Params| {
@@ -182,17 +207,10 @@ fn construct_jsonrpc_server(
         async move {
             let pokemon: Pokemon = params.parse()?;
             sender
-                .send(format!("Update Pokemon named `{}`", &pokemon.name))
+                .send(Message::Updated(pokemon.clone()))
                 .await
                 .unwrap();
-            db.lock()
-                .unwrap()
-                .get_mut(&pokemon.name)
-                .map(|value| {
-                    *value = pokemon;
-                    serde_json::to_value(value).unwrap()
-                })
-                .ok_or_else(|| Error::invalid_params("Entry not found!"))
+            Ok(serde_json::to_value(update_pokemon(db, pokemon)?).unwrap())
         }
     });
 
@@ -215,12 +233,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .parse()
         .expect("Invalid number of threads");
 
-    let (tx, mut rx) = mpsc::channel::<String>(64);
+    let (tx, mut rx) = mpsc::channel::<Message>(64);
 
     let mut swarm = construct_network_swarm().await;
+    let mem_db = Arc::new(Mutex::new(HashMap::new()));
+
     // Spawn tokio thread to handle swarm events
+    let _mem_db = mem_db.clone();
     tokio::spawn(async move {
         loop {
+            let db = _mem_db.clone();
             tokio::select! {
                 event = swarm.select_next_some() => {
                     match event {
@@ -229,15 +251,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         SwarmEvent::Behaviour(PeerEvent::Gossipsub(GossipsubEvent::Message {
                             propagation_source: peer_id,
-                            message_id: id,
+                            message_id: _id,
                             message,
                         })) => {
-                             log::info!(
-                                 "Got message: {} with id: {} from peer: {:?}",
-                                 String::from_utf8_lossy(&message.data),
-                                 id,
-                                 peer_id
-                             );
+                            let message_data;
+                            match serde_json::from_slice(message.data.as_slice()).unwrap() {
+                                Message::Retrieved(search) => {
+                                    message_data = format!("Retrieved a Pokemon named {}", search.name);
+                                    if let Err(err) = retrieve_pokemon(db, &search.name) {
+                                        log::warn!("Sync Data: {:?}", err)
+                                    }
+                                },
+                                Message::Created(pokemon) => {
+                                    message_data = format!("Created a Pokemon named {}", pokemon.name);
+                                    if let Err(err) = create_pokemon(db, pokemon) {
+                                        log::warn!("Sync Data: {:?}", err)
+                                    }
+                                },
+                                Message::Updated(pokemon) => {
+                                    message_data = format!("Updated a Pokemon named {}", pokemon.name);
+                                    if let Err(err) = update_pokemon(db, pokemon) {
+                                        log::warn!("Sync Data: {:?}", err)
+                                    }
+                                }
+                            }
+                            log::info!(
+                                "Got message: {} from peer: {:?}",
+                                message_data,
+                                peer_id
+                            );
+
                         }
                         SwarmEvent::Behaviour(PeerEvent::Mdns(MdnsEvent::Discovered(list))) => {
                             for (peer, _) in list {
@@ -254,15 +297,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         _ => {}
                     }
                 },
-                message = rx.recv() => {
+                Some(message) = rx.recv() => {
                     let node_num = swarm.behaviour().mdns.discovered_nodes().len();
                     if  node_num > 1 {
-                        // Publish only when there are more than 2 peers in the network
-                        log::info!("Publish to other {} nodes", node_num);
+                        // Publish only when there are more than 1 peers in the network
                         if let Err(err) = swarm
                             .behaviour_mut()
                             .gossip
-                            .publish(META_TOPIC.clone(), message.unwrap()) {
+                            .publish(META_TOPIC.clone(), serde_json::to_vec(&message).unwrap()) {
                                 log::error!("{:?}", err)
                         }
                     }
@@ -271,7 +313,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    let mem_db = Arc::new(Mutex::new(HashMap::new()));
     match construct_jsonrpc_server(mem_db, tx, server_address, server_threads) {
         Ok(server) => {
             log::info!(
