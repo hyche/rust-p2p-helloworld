@@ -136,7 +136,7 @@ fn construct_jsonrpc_server(
     sender: mpsc::Sender<String>,
     server_address: SocketAddr,
     server_threads: usize,
-) -> Server {
+) -> Result<Server, std::io::Error> {
     let _sender_create = sender.clone();
     let _sender_update = sender.clone();
     let _mem_db_create = Arc::clone(&mem_db);
@@ -199,7 +199,6 @@ fn construct_jsonrpc_server(
     ServerBuilder::new(io)
         .threads(server_threads)
         .start_http(&server_address)
-        .unwrap()
 }
 
 #[tokio::main]
@@ -273,15 +272,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let mem_db = Arc::new(Mutex::new(HashMap::new()));
-    let jsonrpc_server = construct_jsonrpc_server(mem_db, tx, server_address, server_threads);
-
-    log::info!(
-        "Start JSON-RPC server at {:?} with {:?} threads..",
-        server_address,
-        server_threads
-    );
-
-    jsonrpc_server.wait();
+    match construct_jsonrpc_server(mem_db, tx, server_address, server_threads) {
+        Ok(server) => {
+            log::info!(
+                "Start JSON-RPC server at {:?} with {:?} threads..",
+                server_address,
+                server_threads
+            );
+            server.wait();
+        }
+        Err(err) => log::error!("{:?}", err),
+    };
 
     Ok(())
 }
